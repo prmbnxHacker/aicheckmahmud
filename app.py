@@ -7,7 +7,7 @@ import hashlib
 import uuid
 import gc     # RAM ফ্রি করার জন্য
 import time   # ব্যাকগ্রাউন্ড টাস্ক ডিলে করার জন্য
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, UploadFile, File, Form, Request, Depends, BackgroundTasks
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -100,14 +100,14 @@ def insert_pdf_text(page, point, text, fontsize=7.0, font_style="normal", color=
 
 def process_master_pdf(user_pdf_path, output_path, original_filename, ai_percentage, shared_id):
     user_doc = fitz.open(user_pdf_path)
-    # Smart deletion: Only delete cover/overview pages if user_doc has more than 1 page
+    # Smart cover page stripping: Remove old cover/overview pages if uploaded file is a previously generated report
     if len(user_doc) > 1:
         first_txt = user_doc[0].get_text()
-        if "Cover Page" in first_txt or "Quick Submit" in first_txt or "trn:oid" in first_txt:
+        if any(k in first_txt for k in ["Cover Page", "Quick Submit", "trn:oid", "detected as AI", "AI WRITING REPORT", "ACADEMI.CX"]):
             user_doc.delete_page(0)
             if len(user_doc) > 1:
                 p2_txt = user_doc[0].get_text()
-                if "AI Writing Overview" in p2_txt or "Integrity Overview" in p2_txt or "detected as AI" in p2_txt:
+                if any(k in p2_txt for k in ["AI Writing Overview", "Integrity Overview", "detected as AI", "Overview"]):
                     user_doc.delete_page(0)
 
     actual_pages_count, actual_words, actual_chars = len(user_doc), 0, 0
@@ -122,10 +122,16 @@ def process_master_pdf(user_pdf_path, output_path, original_filename, ai_percent
     base_name = re.sub(r'(?i)ai\s*report', '', os.path.splitext(original_filename)[0].replace("_", " ")).strip()
     new_title = " ".join(base_name.split()[:5]) if base_name.split() else "Document"
 
-    now = datetime.utcnow() + timedelta(hours=6)
+    now = datetime.now(timezone.utc) - timedelta(hours=7)
     sub_time = now - timedelta(minutes=2) 
-    sub_date_str = sub_time.strftime(f"%b {sub_time.day}, %Y, {sub_time.strftime('%I').lstrip('0')}:%M %p BDT")
-    down_date_str = now.strftime(f"%b {now.day}, %Y, {now.strftime('%I').lstrip('0')}:%M %p BDT")
+    
+    def fmt_pst_date(dt):
+        day_str = str(dt.day)
+        hour_str = dt.strftime("%I").lstrip("0")
+        return dt.strftime(f"%b {day_str}. %Y.  {hour_str}:%M %p PST")
+
+    sub_date_str = fmt_pst_date(sub_time)
+    down_date_str = fmt_pst_date(now)
 
     template_doc = fitz.open(TEMPLATE_FILE)
     page1_text = template_doc[0].get_text()
@@ -175,10 +181,12 @@ def process_master_pdf(user_pdf_path, output_path, original_filename, ai_percent
     for old_txt, new_txt in replacements.items():
         if not old_txt: continue
         for inst in page1.search_for(old_txt):
-            rect_to_clear = fitz.Rect(inst.x0 - 40, inst.y0, inst.x1 + 10, inst.y1) if old_txt in [old_pages_text, old_words_text, old_chars_text] else inst
-            page1.add_redact_annot(rect_to_clear, fill=(1, 1, 1))
+            is_right_box = old_txt in [old_pages_text, old_words_text, old_chars_text]
+            fill_color = (0.97265625, 0.97265625, 0.97265625) if is_right_box else (1, 1, 1)
+            rect_to_clear = fitz.Rect(405.0, inst.y0 - 1, inst.x1 + 10, inst.y1 + 1) if is_right_box else inst
+            page1.add_redact_annot(rect_to_clear, fill=fill_color)
             page1.apply_redactions()
-            x_pos = inst.x0 - 7 if old_txt in [old_pages_text, old_words_text, old_chars_text] else inst.x0
+            x_pos = 415.0 if is_right_box else inst.x0
             insert_pdf_text(page1, (x_pos, inst.y1 - 1.5), str(new_txt), fontsize=7.0, font_style="bold", color=(0, 0, 0))
 
     if len(template_doc) > 1:
@@ -190,13 +198,8 @@ def process_master_pdf(user_pdf_path, output_path, original_filename, ai_percent
             page2.apply_redactions()
             insert_pdf_text(page2, (inst.x0, inst.y1 - 4.0), f"{ai_percentage}% detected as AI", fontsize=17.0, font_style="title", color=(0, 0, 0))
 
-        group_inst = page2.search_for("AI-generated only") or page2.search_for("Al-generated only")
+        group_inst = page2.search_for("AI-generated only") or page2.search_for("AI generated only") or page2.search_for("Al-generated only")
         if group_inst:
-            page2.add_redact_annot(fitz.Rect(group_inst[0].x1 + 2, group_inst[0].y0, group_inst[0].x1 + 60, group_inst[0].y1), fill=(1, 1, 1))
-            page2.apply_redactions()
-            insert_pdf_text(page2, (group_inst[0].x1 + 3, group_inst[0].y1 - 1.5), f"{ai_percentage}%", fontsize=7.0, font_style="normal", color=(0, 0, 0))
-            page2.add_redact_annot(fitz.Rect(group_inst[0].x0 - 12, group_inst[0].y0, group_inst[0].x0 - 2, group_inst[0].y1), fill=(1,1,1))
-            page2.apply_redactions()
             try:
                 ai_val = int(str(ai_percentage).replace('*', '').strip())
                 if ai_val == 0: random_detection_num = 0
@@ -205,8 +208,25 @@ def process_master_pdf(user_pdf_path, output_path, original_filename, ai_percent
                 elif ai_val <= 70: random_detection_num = random.randint(16, 35)
                 else: random_detection_num = random.randint(36, 77)
             except: random_detection_num = random.randint(1, 77)
-            x_pos = group_inst[0].x0 - 11 if random_detection_num > 9 else group_inst[0].x0 - 8
-            insert_pdf_text(page2, (x_pos, group_inst[0].y1 - 1.5), str(random_detection_num), fontsize=7.0, font_style="bold", color=(0, 0, 0))
+
+            page2.add_redact_annot(fitz.Rect(50.0, 180.0, 320.0, 250.0), fill=(1, 1, 1))
+            page2.apply_redactions()
+
+            num_str = str(random_detection_num)
+            insert_pdf_text(page2, (52.0, 196.5), num_str, fontsize=7.0, font_style="bold", color=(0, 0, 0))
+            text_x = 60.0 if len(num_str) == 1 else 63.0
+            insert_pdf_text(page2, (text_x, 196.5), "AI generated only", fontsize=7.0, font_style="normal", color=(0, 0, 0))
+            pct_x = text_x + 59.0
+            insert_pdf_text(page2, (pct_x, 196.5), f"{ai_percentage}%", fontsize=7.0, font_style="normal", color=(0, 0, 0))
+
+            insert_pdf_text(page2, (52.0, 206.5), "Likely AI generated text from a large language model.", fontsize=7.0, font_style="normal", color=(0.35, 0.35, 0.35))
+
+            insert_pdf_text(page2, (52.0, 224.5), "0", fontsize=7.0, font_style="bold", color=(0, 0, 0))
+            insert_pdf_text(page2, (60.0, 224.5), "AI generated text that was AI paraphrased", fontsize=7.0, font_style="normal", color=(0, 0, 0))
+            insert_pdf_text(page2, (198.0, 224.5), "0%", fontsize=7.0, font_style="normal", color=(0, 0, 0))
+
+            insert_pdf_text(page2, (52.0, 234.5), "Likely AI generated text that was likely revised using an AI paraphrase tool", fontsize=7.0, font_style="normal", color=(0.35, 0.35, 0.35))
+            insert_pdf_text(page2, (52.0, 244.5), "or word spinner.", fontsize=7.0, font_style="normal", color=(0.35, 0.35, 0.35))
 
     template_doc.insert_pdf(user_doc)
     
@@ -216,31 +236,76 @@ def process_master_pdf(user_pdf_path, output_path, original_filename, ai_percent
 
     for i, page in enumerate(template_doc):
         rect = page.rect
-        header_height, footer_height = (50, 50) if i < 2 else (45, 45)
+        header_height, footer_height = (42, 42) if i < 2 else (18, 18)
         header_title = "Cover Page" if i == 0 else "AI Writing Overview" if i == 1 else "AI Writing Submission"
         header_text = f"Page {i + 1} of {len(template_doc)} - {header_title}"
         
-        header_rect = fitz.Rect(0, 0, rect.width, header_height)
-        footer_rect = fitz.Rect(0, rect.height - footer_height, rect.width, rect.height)
+        if i < 2:
+            header_rect = fitz.Rect(0, 0, rect.width, header_height)
+            footer_rect = fitz.Rect(0, rect.height - footer_height, rect.width, rect.height)
 
-        page.clean_contents() 
-        page.draw_rect(header_rect, fill=(1, 1, 1), color=None, overlay=True)
-        page.draw_rect(footer_rect, fill=(1, 1, 1), color=None, overlay=True)
-        page.add_redact_annot(header_rect, fill=(1, 1, 1))
-        page.add_redact_annot(footer_rect, fill=(1, 1, 1))
-        page.apply_redactions()
+            page.clean_contents() 
+            page.draw_rect(header_rect, fill=(1, 1, 1), color=None, overlay=True)
+            page.draw_rect(footer_rect, fill=(1, 1, 1), color=None, overlay=True)
+            page.add_redact_annot(header_rect, fill=(1, 1, 1))
+            page.add_redact_annot(footer_rect, fill=(1, 1, 1))
+            page.apply_redactions()
 
-        if os.path.exists(logo_path):
-            page.insert_image(fitz.Rect(20, 15, 95, 38), filename=logo_path)
-            page.insert_image(fitz.Rect(20, 735, 95, 758), filename=logo_path)
+            if os.path.exists(logo_path):
+                page.insert_image(fitz.Rect(36, 24, 91, 40.5), filename=logo_path)
+                page.insert_image(fitz.Rect(36, 748, 91, 764.5), filename=logo_path)
+                
+            insert_pdf_text(page, fitz.Point(107, 34), header_text, fontsize=6.0, font_style="normal", color=(0, 0, 0))
+            insert_pdf_text(page, fitz.Point(467.5, 34), "Submission ID", fontsize=6.0, font_style="normal", color=(0, 0, 0))
+            insert_pdf_text(page, fitz.Point(513.0, 34), new_id, fontsize=6.0, font_style="normal", color=(0, 0, 0))
+
+            insert_pdf_text(page, fitz.Point(107, 758), header_text, fontsize=6.0, font_style="normal", color=(0, 0, 0))
+            insert_pdf_text(page, fitz.Point(467.5, 758), "Submission ID", fontsize=6.0, font_style="normal", color=(0, 0, 0))
+            insert_pdf_text(page, fitz.Point(513.0, 758), new_id, fontsize=6.0, font_style="normal", color=(0, 0, 0))
+        else:
+            top_overlay_rect = fitz.Rect(0, 0, rect.width, 25)
+            bot_overlay_rect = fitz.Rect(0, rect.height - 24, rect.width, rect.height)
+
+            page.draw_rect(top_overlay_rect, fill=(1, 1, 1), color=None, overlay=True)
+            page.draw_rect(bot_overlay_rect, fill=(1, 1, 1), color=None, overlay=True)
+
+            if os.path.exists(logo_path):
+                page.insert_image(fitz.Rect(36, 10, 91, 24.5), filename=logo_path)
+                page.insert_image(fitz.Rect(36, rect.height - 22, 91, rect.height - 7.5), filename=logo_path)
+                
+            insert_pdf_text(page, fitz.Point(107, 21), header_text, fontsize=6.0, font_style="normal", color=(0, 0, 0))
+            insert_pdf_text(page, fitz.Point(467.5, 21), "Submission ID", fontsize=6.0, font_style="normal", color=(0, 0, 0))
+            insert_pdf_text(page, fitz.Point(513.0, 21), new_id, fontsize=6.0, font_style="normal", color=(0, 0, 0))
+
+            insert_pdf_text(page, fitz.Point(107, rect.height - 9), header_text, fontsize=6.0, font_style="normal", color=(0, 0, 0))
+            insert_pdf_text(page, fitz.Point(467.5, rect.height - 9), "Submission ID", fontsize=6.0, font_style="normal", color=(0, 0, 0))
+            insert_pdf_text(page, fitz.Point(513.0, rect.height - 9), new_id, fontsize=6.0, font_style="normal", color=(0, 0, 0))
+
+        # Convert ALL colored AI highlights into 1 SINGLE unified Hex #C5E9F8 Cyan color
+        cyan_color = (0.7725490196078432, 0.9137254901960784, 0.9725490196078431)
+        if i >= 2:
+            # 1. Recolor native PDF annotations
+            for a in list(page.annots()):
+                if a.colors and ("fill" in a.colors or "stroke" in a.colors):
+                    a.set_colors(stroke=cyan_color, fill=cyan_color)
+                    a.update()
+
+            # 2. Recolor vector drawings behind text layer (overlay=False) for 100% smooth mouse selection
+            highlight_rects = []
+            for d in page.get_drawings():
+                fill = d.get("fill")
+                if fill:
+                    r_val, g_val, b_val = fill[0], fill[1], fill[2]
+                    is_white = (r_val > 0.98 and g_val > 0.98 and b_val > 0.98)
+                    is_neutral_gray = (abs(r_val - g_val) < 0.02 and abs(g_val - b_val) < 0.02 and abs(r_val - b_val) < 0.02)
+                    if not is_white and not is_neutral_gray and (b_val > r_val or g_val > r_val):
+                        highlight_rects.append(d["rect"])
             
-        insert_pdf_text(page, fitz.Point(107, 34), header_text, fontsize=6.0, font_style="normal", color=(0, 0, 0))
-        insert_pdf_text(page, fitz.Point(467.5, 34), "Submission ID", fontsize=6.0, font_style="normal", color=(0, 0, 0))
-        insert_pdf_text(page, fitz.Point(513.0, 34), new_id, fontsize=6.0, font_style="normal", color=(0, 0, 0))
-
-        insert_pdf_text(page, fitz.Point(107, 752), header_text, fontsize=6.0, font_style="normal", color=(0, 0, 0))
-        insert_pdf_text(page, fitz.Point(467.5, 752), "Submission ID", fontsize=6.0, font_style="normal", color=(0, 0, 0))
-        insert_pdf_text(page, fitz.Point(513.0, 752), new_id, fontsize=6.0, font_style="normal", color=(0, 0, 0))
+            if highlight_rects:
+                for r in highlight_rects:
+                    erase_rect = fitz.Rect(r.x0 - 0.5, r.y0 - 0.5, r.x1 + 0.5, r.y1 + 2.5)
+                    page.draw_rect(erase_rect, fill=(1, 1, 1), color=None, fill_opacity=1.0, overlay=False)
+                    page.draw_rect(r, fill=cyan_color, color=None, fill_opacity=1.0, overlay=False)
 
     template_doc.set_metadata({"producer": "pdf-lib (https://github.com/Hopding/pdf-lib)"})
     template_doc.save(output_path, deflate=True, garbage=4)
@@ -258,43 +323,59 @@ def apply_header_and_footer(input_pdf_path, output_path, shared_id):
     if not os.path.exists(logo_path):
         logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "logo.png")
 
-    has_cover = False
-    if len(doc) > 0:
+    if len(doc) > 1:
         first_txt = doc[0].get_text()
-        if "Cover Page" in first_txt or "Quick Submit" in first_txt or "trn:oid" in first_txt:
-            has_cover = True
+        if any(k in first_txt for k in ["Cover Page", "Quick Submit", "trn:oid", "detected as AI", "AI WRITING REPORT", "ACADEMI.CX"]):
+            doc.delete_page(0)
+            if len(doc) > 1:
+                p2_txt = doc[0].get_text()
+                if any(k in p2_txt for k in ["AI Writing Overview", "Integrity Overview", "detected as AI", "Overview"]):
+                    doc.delete_page(0)
 
+    cyan_color = (0.7725490196078432, 0.9137254901960784, 0.9725490196078431)
     for i, page in enumerate(doc):
         rect = page.rect
-        header_height, footer_height = (50, 50) if (has_cover and i < 2) else (45, 45)
-        if has_cover:
-            header_title = "Cover Page" if i == 0 else "Integrity Overview" if i == 1 else "Integrity Submission"
-        else:
-            header_title = "Integrity Submission"
-
+        header_title = "Integrity Submission"
         header_text = f"Page {i + 1} of {len(doc)} - {header_title}"
 
-        header_rect = fitz.Rect(0, 0, rect.width, header_height)
-        footer_rect = fitz.Rect(0, rect.height - footer_height, rect.width, rect.height)
+        top_overlay_rect = fitz.Rect(0, 0, rect.width, 25)
+        bot_overlay_rect = fitz.Rect(0, rect.height - 24, rect.width, rect.height)
 
-        page.clean_contents()
-        page.draw_rect(header_rect, fill=(1, 1, 1), color=None, overlay=True)
-        page.draw_rect(footer_rect, fill=(1, 1, 1), color=None, overlay=True)
-        page.add_redact_annot(header_rect, fill=(1, 1, 1))
-        page.add_redact_annot(footer_rect, fill=(1, 1, 1))
-        page.apply_redactions()
+        page.draw_rect(top_overlay_rect, fill=(1, 1, 1), color=None, overlay=True)
+        page.draw_rect(bot_overlay_rect, fill=(1, 1, 1), color=None, overlay=True)
 
         if os.path.exists(logo_path):
-            page.insert_image(fitz.Rect(20, 15, 95, 38), filename=logo_path)
-            page.insert_image(fitz.Rect(20, 735, 95, 758), filename=logo_path)
+            page.insert_image(fitz.Rect(36, 10, 91, 24.5), filename=logo_path)
+            page.insert_image(fitz.Rect(36, rect.height - 22, 91, rect.height - 7.5), filename=logo_path)
 
-        insert_pdf_text(page, fitz.Point(107, 34), header_text, fontsize=6.0, font_style="normal", color=(0, 0, 0))
-        insert_pdf_text(page, fitz.Point(467.5, 34), "Submission ID", fontsize=6.0, font_style="normal", color=(0, 0, 0))
-        insert_pdf_text(page, fitz.Point(513.0, 34), shared_id, fontsize=6.0, font_style="normal", color=(0, 0, 0))
+        insert_pdf_text(page, fitz.Point(107, 21), header_text, fontsize=6.0, font_style="normal", color=(0, 0, 0))
+        insert_pdf_text(page, fitz.Point(467.5, 21), "Submission ID", fontsize=6.0, font_style="normal", color=(0, 0, 0))
+        insert_pdf_text(page, fitz.Point(513.0, 21), shared_id, fontsize=6.0, font_style="normal", color=(0, 0, 0))
 
-        insert_pdf_text(page, fitz.Point(107, 752), header_text, fontsize=6.0, font_style="normal", color=(0, 0, 0))
-        insert_pdf_text(page, fitz.Point(467.5, 752), "Submission ID", fontsize=6.0, font_style="normal", color=(0, 0, 0))
-        insert_pdf_text(page, fitz.Point(513.0, 752), shared_id, fontsize=6.0, font_style="normal", color=(0, 0, 0))
+        insert_pdf_text(page, fitz.Point(107, rect.height - 9), header_text, fontsize=6.0, font_style="normal", color=(0, 0, 0))
+        insert_pdf_text(page, fitz.Point(467.5, rect.height - 9), "Submission ID", fontsize=6.0, font_style="normal", color=(0, 0, 0))
+        insert_pdf_text(page, fitz.Point(513.0, rect.height - 9), shared_id, fontsize=6.0, font_style="normal", color=(0, 0, 0))
+
+        for a in list(page.annots()):
+            if a.colors and ("fill" in a.colors or "stroke" in a.colors):
+                a.set_colors(stroke=cyan_color, fill=cyan_color)
+                a.update()
+
+        highlight_rects = []
+        for d in page.get_drawings():
+            fill = d.get("fill")
+            if fill:
+                r_val, g_val, b_val = fill[0], fill[1], fill[2]
+                is_white = (r_val > 0.98 and g_val > 0.98 and b_val > 0.98)
+                is_neutral_gray = (abs(r_val - g_val) < 0.02 and abs(g_val - b_val) < 0.02 and abs(r_val - b_val) < 0.02)
+                if not is_white and not is_neutral_gray and (b_val > r_val or g_val > r_val):
+                    highlight_rects.append(d["rect"])
+        
+        if highlight_rects:
+            for r in highlight_rects:
+                erase_rect = fitz.Rect(r.x0 - 0.5, r.y0 - 0.5, r.x1 + 0.5, r.y1 + 2.5)
+                page.draw_rect(erase_rect, fill=(1, 1, 1), color=None, fill_opacity=1.0, overlay=False)
+                page.draw_rect(r, fill=cyan_color, color=None, fill_opacity=1.0, overlay=False)
     doc.set_metadata({"producer": "pdf-lib (https://github.com/Hopding/pdf-lib)"})
     doc.save(output_path)
     doc.close()
