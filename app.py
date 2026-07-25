@@ -85,9 +85,31 @@ def check_and_reset_credits(username):
     return 0
 
 # --- PDF Processing Logic ---
+LEXEND_FONT_PATH = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "LexendDeca-Medium.ttf"))
+if not os.path.exists(LEXEND_FONT_PATH):
+    LEXEND_FONT_PATH = os.path.abspath("static/LexendDeca-Medium.ttf")
+
+def insert_pdf_text(page, point, text, fontsize=7.0, font_style="normal", color=(0, 0, 0)):
+    if font_style in ["title", "author"] and os.path.exists(LEXEND_FONT_PATH):
+        try:
+            page.insert_text(point, text, fontsize=fontsize, fontname="lexend", fontfile=LEXEND_FONT_PATH, color=color)
+            return
+        except Exception:
+            pass
+    page.insert_text(point, text, fontsize=fontsize, fontname="hebo" if font_style == "bold" else "helv", color=color)
+
 def process_master_pdf(user_pdf_path, output_path, original_filename, ai_percentage, shared_id):
     user_doc = fitz.open(user_pdf_path)
-    if len(user_doc) > 0: user_doc.delete_page(0)
+    # Smart deletion: Only delete cover/overview pages if user_doc has more than 1 page
+    if len(user_doc) > 1:
+        first_txt = user_doc[0].get_text()
+        if "Cover Page" in first_txt or "Quick Submit" in first_txt or "trn:oid" in first_txt:
+            user_doc.delete_page(0)
+            if len(user_doc) > 1:
+                p2_txt = user_doc[0].get_text()
+                if "AI Writing Overview" in p2_txt or "Integrity Overview" in p2_txt or "detected as AI" in p2_txt:
+                    user_doc.delete_page(0)
+
     actual_pages_count, actual_words, actual_chars = len(user_doc), 0, 0
     for p in user_doc:
         body_rect = fitz.Rect(0, 38, p.rect.width, p.rect.height - 38)
@@ -110,7 +132,7 @@ def process_master_pdf(user_pdf_path, output_path, original_filename, ai_percent
     
     old_id_match = re.search(r"trn:oid:::\d:\d+", page1_text)
     old_id = old_id_match.group(0) if old_id_match else None
-    old_title_match = re.search(r"Aa Aa\s+(.*?)\s+Quick Submit", page1_text, re.DOTALL)
+    old_title_match = re.search(r"([^\n]+)\s+Aa Aa", page1_text)
     old_title = old_title_match.group(1).strip() if old_title_match else "Fresh Template"
     old_fname_match = re.search(r"File Name\s+(.*?)\s+File Size", page1_text, re.DOTALL)
     old_fname_in_details = old_fname_match.group(1).strip() if old_fname_match else None
@@ -125,31 +147,39 @@ def process_master_pdf(user_pdf_path, output_path, original_filename, ai_percent
     old_down_date_match = re.search(r"Download Date\s+(.*?)\s+File Name", page1_text, re.DOTALL)
     old_down_date = old_down_date_match.group(1).strip() if old_down_date_match else None
 
+    page1 = template_doc[0]
+
+    # 1. Main Title Replacement
+    for inst in page1.search_for(old_title):
+        page1.add_redact_annot(fitz.Rect(inst.x0 - 2, inst.y0 - 2, inst.x1 + 10, inst.y1 + 2), fill=(1, 1, 1))
+        page1.apply_redactions()
+        insert_pdf_text(page1, (inst.x0, inst.y1 - 4.0), str(new_title), fontsize=17.0, font_style="title", color=(0, 0, 0))
+
+    # 2. Author Replacement ("Aa Aa")
+    aa_matches = page1.search_for("Aa Aa")
+    if aa_matches:
+        for aa_inst in aa_matches:
+            page1.add_redact_annot(fitz.Rect(aa_inst.x0 - 2, aa_inst.y0 - 2, aa_inst.x1 + 10, aa_inst.y1 + 2), fill=(1, 1, 1))
+            page1.apply_redactions()
+            insert_pdf_text(page1, (aa_inst.x0, aa_inst.y1 - 4.0), "Labib Hasan", fontsize=20.0, font_style="author", color=(0, 0, 0))
+
+    # 3. Document Details Replacements
     replacements = {
-        old_id: new_id, old_title: new_title, old_fname_in_details: original_filename, 
+        old_id: new_id, old_fname_in_details: original_filename, 
         old_pages_text: f"{actual_pages_count + 2} Pages", old_words_text: f"{actual_words:,} Words",
         old_chars_text: f"{actual_chars:,} Characters", "23.5 KB": new_size
     }
     if old_sub_date: replacements[old_sub_date] = sub_date_str
     if old_down_date: replacements[old_down_date] = down_date_str
 
-    page1 = template_doc[0]
     for old_txt, new_txt in replacements.items():
         if not old_txt: continue
         for inst in page1.search_for(old_txt):
             rect_to_clear = fitz.Rect(inst.x0 - 40, inst.y0, inst.x1 + 10, inst.y1) if old_txt in [old_pages_text, old_words_text, old_chars_text] else inst
             page1.add_redact_annot(rect_to_clear, fill=(1, 1, 1))
             page1.apply_redactions()
-            is_main_title = (old_txt == old_title)
             x_pos = inst.x0 - 7 if old_txt in [old_pages_text, old_words_text, old_chars_text] else inst.x0
-            page1.insert_text((x_pos, inst.y1 - 2), str(new_txt), fontsize=18 if is_main_title else 9.5, fontname="hebo" if is_main_title else "helv", color=(0, 0, 0))
-
-    aa_matches = page1.search_for("Aa Aa")
-    if aa_matches:
-        for aa_inst in aa_matches:
-            page1.add_redact_annot(fitz.Rect(aa_inst.x0 - 2, aa_inst.y0 - 2, aa_inst.x1 + 10, aa_inst.y1 + 2), fill=(1, 1, 1))
-            page1.apply_redactions()
-            page1.insert_text((aa_inst.x0, aa_inst.y1), "Labib Hasan", fontsize=20, fontname="hebo", color=(0, 0, 0))
+            insert_pdf_text(page1, (x_pos, inst.y1 - 1.5), str(new_txt), fontsize=7.0, font_style="bold", color=(0, 0, 0))
 
     if len(template_doc) > 1:
         page2 = template_doc[1]
@@ -158,18 +188,13 @@ def process_master_pdf(user_pdf_path, output_path, original_filename, ai_percent
             inst = ai_headers[0]
             page2.add_redact_annot(fitz.Rect(inst.x0, inst.y0 - 2, inst.x1 + 5, inst.y1 - 4), fill=(1, 1, 1))
             page2.apply_redactions()
-            font_name_to_use, font_size_to_use = "hebo", 18
-            font_path = os.path.join("static", "LexendDeca-Medium.ttf")
-            if os.path.exists(font_path):
-                try: page2.insert_font(fontname="lexend", fontfile=font_path); font_name_to_use, font_size_to_use = "lexend", 17
-                except: pass
-            page2.insert_text((inst.x0, inst.y1 - 4), f"{ai_percentage}% detected as AI", fontsize=font_size_to_use, fontname=font_name_to_use, color=(0, 0, 0))
+            insert_pdf_text(page2, (inst.x0, inst.y1 - 4.0), f"{ai_percentage}% detected as AI", fontsize=17.0, font_style="title", color=(0, 0, 0))
 
         group_inst = page2.search_for("AI-generated only") or page2.search_for("Al-generated only")
         if group_inst:
             page2.add_redact_annot(fitz.Rect(group_inst[0].x1 + 2, group_inst[0].y0, group_inst[0].x1 + 60, group_inst[0].y1), fill=(1, 1, 1))
             page2.apply_redactions()
-            page2.insert_text((group_inst[0].x1 + 3, group_inst[0].y1 - 2), f"{ai_percentage}%", fontsize=9.5, fontname="helv", color=(0, 0, 0))
+            insert_pdf_text(page2, (group_inst[0].x1 + 3, group_inst[0].y1 - 1.5), f"{ai_percentage}%", fontsize=7.0, font_style="normal", color=(0, 0, 0))
             page2.add_redact_annot(fitz.Rect(group_inst[0].x0 - 12, group_inst[0].y0, group_inst[0].x0 - 2, group_inst[0].y1), fill=(1,1,1))
             page2.apply_redactions()
             try:
@@ -181,25 +206,23 @@ def process_master_pdf(user_pdf_path, output_path, original_filename, ai_percent
                 else: random_detection_num = random.randint(36, 77)
             except: random_detection_num = random.randint(1, 77)
             x_pos = group_inst[0].x0 - 11 if random_detection_num > 9 else group_inst[0].x0 - 8
-            page2.insert_text((x_pos, group_inst[0].y1 - 1.5), str(random_detection_num), fontsize=8.5, fontname="hebo", color=(0, 0, 0))
+            insert_pdf_text(page2, (x_pos, group_inst[0].y1 - 1.5), str(random_detection_num), fontsize=7.0, font_style="bold", color=(0, 0, 0))
 
     template_doc.insert_pdf(user_doc)
     
-    # ফাইলগুলো ভিন্ন ভিন্ন ফোল্ডারে থাকলেও যাতে লোগো খুঁজে পায় তার ডাইনামিক পাথ হ্যান্ডলিং
     logo_path = "static/logo.png"
     if not os.path.exists(logo_path):
         logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "logo.png")
 
     for i, page in enumerate(template_doc):
         rect = page.rect
-        header_height, footer_height = (50, 50) if i < 2 else (38, 38)
+        header_height, footer_height = (50, 50) if i < 2 else (45, 45)
         header_title = "Cover Page" if i == 0 else "AI Writing Overview" if i == 1 else "AI Writing Submission"
         header_text = f"Page {i + 1} of {len(template_doc)} - {header_title}"
         
         header_rect = fitz.Rect(0, 0, rect.width, header_height)
         footer_rect = fitz.Rect(0, rect.height - footer_height, rect.width, rect.height)
 
-        # ১. ওল্ড হেডার/ফুটার কন্টেন্ট সম্পূর্ণ ভেক্টর রিডাকশন প্রসেসে ডিলিট করা হচ্ছে
         page.clean_contents() 
         page.draw_rect(header_rect, fill=(1, 1, 1), color=None, overlay=True)
         page.draw_rect(footer_rect, fill=(1, 1, 1), color=None, overlay=True)
@@ -207,15 +230,17 @@ def process_master_pdf(user_pdf_path, output_path, original_filename, ai_percent
         page.add_redact_annot(footer_rect, fill=(1, 1, 1))
         page.apply_redactions()
 
-        # ২. নতুন করে টেক্সট ও লোগো সরাসরি ভেক্টর এলিমেন্ট হিসেবে ইনপুট করা হচ্ছে (যা কখনোই জুম করলে ফাটবে না)
         if os.path.exists(logo_path):
-            page.insert_image(fitz.Rect(20, 15, 90, 35), filename=logo_path)
-            page.insert_image(fitz.Rect(20, rect.height - 35, 90, rect.height - 15), filename=logo_path)
+            page.insert_image(fitz.Rect(20, 15, 95, 38), filename=logo_path)
+            page.insert_image(fitz.Rect(20, 735, 95, 758), filename=logo_path)
             
-        page.insert_text(fitz.Point(110, 30), header_text, fontsize=7, color=(0, 0, 0))
-        page.insert_text(fitz.Point(rect.width - 200, 30), f"Submission ID {new_id}", fontsize=7, color=(0, 0, 0))
-        page.insert_text(fitz.Point(110, rect.height - 20), header_text, fontsize=7, color=(0, 0, 0))
-        page.insert_text(fitz.Point(rect.width - 200, rect.height - 20), f"Submission ID {new_id}", fontsize=7, color=(0, 0, 0))
+        insert_pdf_text(page, fitz.Point(107, 34), header_text, fontsize=6.0, font_style="normal", color=(0, 0, 0))
+        insert_pdf_text(page, fitz.Point(467.5, 34), "Submission ID", fontsize=6.0, font_style="normal", color=(0, 0, 0))
+        insert_pdf_text(page, fitz.Point(513.0, 34), new_id, fontsize=6.0, font_style="normal", color=(0, 0, 0))
+
+        insert_pdf_text(page, fitz.Point(107, 752), header_text, fontsize=6.0, font_style="normal", color=(0, 0, 0))
+        insert_pdf_text(page, fitz.Point(467.5, 752), "Submission ID", fontsize=6.0, font_style="normal", color=(0, 0, 0))
+        insert_pdf_text(page, fitz.Point(513.0, 752), new_id, fontsize=6.0, font_style="normal", color=(0, 0, 0))
 
     template_doc.set_metadata({"producer": "pdf-lib (https://github.com/Hopding/pdf-lib)"})
     template_doc.save(output_path, deflate=True, garbage=4)
@@ -233,17 +258,43 @@ def apply_header_and_footer(input_pdf_path, output_path, shared_id):
     if not os.path.exists(logo_path):
         logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "logo.png")
 
+    has_cover = False
+    if len(doc) > 0:
+        first_txt = doc[0].get_text()
+        if "Cover Page" in first_txt or "Quick Submit" in first_txt or "trn:oid" in first_txt:
+            has_cover = True
+
     for i, page in enumerate(doc):
         rect = page.rect
-        header_title = "Cover Page" if i == 0 else "Integrity Overview" if i == 1 else "Integrity Submission"
+        header_height, footer_height = (50, 50) if (has_cover and i < 2) else (45, 45)
+        if has_cover:
+            header_title = "Cover Page" if i == 0 else "Integrity Overview" if i == 1 else "Integrity Submission"
+        else:
+            header_title = "Integrity Submission"
+
         header_text = f"Page {i + 1} of {len(doc)} - {header_title}"
+
+        header_rect = fitz.Rect(0, 0, rect.width, header_height)
+        footer_rect = fitz.Rect(0, rect.height - footer_height, rect.width, rect.height)
+
+        page.clean_contents()
+        page.draw_rect(header_rect, fill=(1, 1, 1), color=None, overlay=True)
+        page.draw_rect(footer_rect, fill=(1, 1, 1), color=None, overlay=True)
+        page.add_redact_annot(header_rect, fill=(1, 1, 1))
+        page.add_redact_annot(footer_rect, fill=(1, 1, 1))
+        page.apply_redactions()
+
         if os.path.exists(logo_path):
-            page.insert_image(fitz.Rect(20, 15, 90, 35), filename=logo_path)
-            page.insert_image(fitz.Rect(20, rect.height - 35, 90, rect.height - 15), filename=logo_path)
-        page.insert_text(fitz.Point(110, 30), header_text, fontsize=7, color=(0, 0, 0))
-        page.insert_text(fitz.Point(rect.width - 200, 30), f"Submission ID {shared_id}", fontsize=7, color=(0, 0, 0))
-        page.insert_text(fitz.Point(110, rect.height - 20), header_text, fontsize=7, color=(0, 0, 0))
-        page.insert_text(fitz.Point(rect.width - 200, rect.height - 20), f"Submission ID {shared_id}", fontsize=7, color=(0, 0, 0))
+            page.insert_image(fitz.Rect(20, 15, 95, 38), filename=logo_path)
+            page.insert_image(fitz.Rect(20, 735, 95, 758), filename=logo_path)
+
+        insert_pdf_text(page, fitz.Point(107, 34), header_text, fontsize=6.0, font_style="normal", color=(0, 0, 0))
+        insert_pdf_text(page, fitz.Point(467.5, 34), "Submission ID", fontsize=6.0, font_style="normal", color=(0, 0, 0))
+        insert_pdf_text(page, fitz.Point(513.0, 34), shared_id, fontsize=6.0, font_style="normal", color=(0, 0, 0))
+
+        insert_pdf_text(page, fitz.Point(107, 752), header_text, fontsize=6.0, font_style="normal", color=(0, 0, 0))
+        insert_pdf_text(page, fitz.Point(467.5, 752), "Submission ID", fontsize=6.0, font_style="normal", color=(0, 0, 0))
+        insert_pdf_text(page, fitz.Point(513.0, 752), shared_id, fontsize=6.0, font_style="normal", color=(0, 0, 0))
     doc.set_metadata({"producer": "pdf-lib (https://github.com/Hopding/pdf-lib)"})
     doc.save(output_path)
     doc.close()
