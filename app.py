@@ -43,6 +43,16 @@ def get_bdt_time():
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
+def db_execute(builder, default=None, retries=3):
+    for attempt in range(retries):
+        try:
+            return builder.execute()
+        except Exception as e:
+            if attempt == retries - 1:
+                print("DB Query Error:", e)
+                return default
+            time.sleep(0.3)
+
 @app.on_event("startup")
 async def setup_default_accounts():
     accounts = [
@@ -51,17 +61,17 @@ async def setup_default_accounts():
     ]
     for acc in accounts:
         try:
-            res = supabase.table("users").select("username").eq("username", acc["username"]).execute()
-            if not res.data:
-                supabase.table("users").insert({
+            res = db_execute(supabase.table("users").select("username").eq("username", acc["username"]))
+            if res and not res.data:
+                db_execute(supabase.table("users").insert({
                     "username": acc["username"], "password": hash_password(acc["password"]),
                     "role": acc["role"], "daily_credits": acc["credits"],
                     "credit_limit": acc["credits"], "used_credits": 0, "last_reset_date": get_bdt_date()
-                }).execute()
-            else:
-                supabase.table("users").update({
+                }))
+            elif res:
+                db_execute(supabase.table("users").update({
                     "password": hash_password(acc["password"]), "role": acc["role"]
-                }).eq("username", acc["username"]).execute()
+                }).eq("username", acc["username"]))
         except Exception as e:
             print("Setup error:", e)
 
@@ -69,19 +79,14 @@ def check_active_session(request: Request):
     username = request.session.get("username")
     token = request.session.get("session_token")
     if not username or not token: return False
-    try:
-        res = supabase.table("users").select("session_token").eq("username", username).execute()
-        if res.data and res.data[0].get("session_token") == token: return True
-    except: pass
+    res = db_execute(supabase.table("users").select("session_token").eq("username", username))
+    if res and res.data and res.data[0].get("session_token") == token: return True
     return False
 
 def check_and_reset_credits(username):
-    try:
-        res = supabase.table("users").select("daily_credits").eq("username", username).execute()
-        if res.data:
-            return res.data[0].get("daily_credits", 0)
-    except:
-        pass
+    res = db_execute(supabase.table("users").select("daily_credits").eq("username", username))
+    if res and res.data:
+        return res.data[0].get("daily_credits", 0)
     return 0
 
 # --- PDF Processing Logic ---
@@ -100,6 +105,15 @@ def insert_pdf_text(page, point, text, fontsize=7.0, font_style="normal", color=
 
 def process_master_pdf(user_pdf_path, output_path, original_filename, ai_percentage, shared_id):
     user_doc = fitz.open(user_pdf_path)
+
+    # Words and Characters count ignores first 2 pages and starts strictly from page 3 (index 2) onwards
+    actual_words, actual_chars = 0, 0
+    pages_to_count = user_doc[2:] if len(user_doc) > 2 else user_doc
+    for p in pages_to_count:
+        text = p.get_text("text")
+        actual_words += len(text.split())
+        actual_chars += len(text)
+
     # Smart cover page stripping: Remove old cover/overview pages if uploaded file is a previously generated report
     if len(user_doc) > 1:
         first_txt = user_doc[0].get_text()
@@ -107,31 +121,26 @@ def process_master_pdf(user_pdf_path, output_path, original_filename, ai_percent
             user_doc.delete_page(0)
             if len(user_doc) > 1:
                 p2_txt = user_doc[0].get_text()
-                if any(k in p2_txt for k in ["AI Writing Overview", "Integrity Overview", "detected as AI", "Overview"]):
+                if any(k in p2_txt for k in ["AI Writing Overview", "Integrity Overview", "detected as AI", "Overview", "Submission", "Declaration", "Plagiarism", "Assessment"]):
                     user_doc.delete_page(0)
 
-    actual_pages_count, actual_words, actual_chars = len(user_doc), 0, 0
-    for p in user_doc:
-        body_rect = fitz.Rect(0, 38, p.rect.width, p.rect.height - 38)
-        text = p.get_text("text", clip=body_rect)
-        actual_words += len(text.split())
-        actual_chars += len(text)
+    actual_pages_count = len(user_doc)
     
     new_size = f"{os.path.getsize(user_pdf_path) / 1024:.1f} KB"
     new_id = shared_id
     base_name = re.sub(r'(?i)ai\s*report', '', os.path.splitext(original_filename)[0].replace("_", " ")).strip()
     new_title = " ".join(base_name.split()[:5]) if base_name.split() else "Document"
 
-    now = datetime.now(timezone.utc) - timedelta(hours=7)
+    now = datetime.now(timezone.utc) + timedelta(hours=6)
     sub_time = now - timedelta(minutes=2) 
     
-    def fmt_pst_date(dt):
+    def fmt_gmt6_date(dt):
         day_str = str(dt.day)
         hour_str = dt.strftime("%I").lstrip("0")
-        return dt.strftime(f"%b {day_str}. %Y.  {hour_str}:%M %p PST")
+        return dt.strftime(f"%b {day_str}. %Y.  {hour_str}:%M %p GMT+6")
 
-    sub_date_str = fmt_pst_date(sub_time)
-    down_date_str = fmt_pst_date(now)
+    sub_date_str = fmt_gmt6_date(sub_time)
+    down_date_str = fmt_gmt6_date(now)
 
     template_doc = fitz.open(TEMPLATE_FILE)
     page1_text = template_doc[0].get_text()
@@ -329,7 +338,7 @@ def apply_header_and_footer(input_pdf_path, output_path, shared_id):
             doc.delete_page(0)
             if len(doc) > 1:
                 p2_txt = doc[0].get_text()
-                if any(k in p2_txt for k in ["AI Writing Overview", "Integrity Overview", "detected as AI", "Overview"]):
+                if any(k in p2_txt for k in ["AI Writing Overview", "Integrity Overview", "detected as AI", "Overview", "Submission", "Declaration", "Plagiarism", "Assessment"]):
                     doc.delete_page(0)
 
     cyan_color = (0.7725490196078432, 0.9137254901960784, 0.9725490196078431)
@@ -391,11 +400,11 @@ async def login_page(request: Request):
 @app.post("/login")
 async def login_post(request: Request, username: str = Form(...), password: str = Form(...)):
     try:
-        res = supabase.table("users").select("role").eq("username", username).eq("password", hash_password(password)).execute()
-        if res.data:
+        res = db_execute(supabase.table("users").select("role").eq("username", username).eq("password", hash_password(password)))
+        if res and res.data:
             role = res.data[0]['role']
             token = str(uuid.uuid4())
-            supabase.table("users").update({"session_token": token}).eq("username", username).execute()
+            db_execute(supabase.table("users").update({"session_token": token}).eq("username", username))
             request.session.update({"username": username, "role": role, "session_token": token})
             return RedirectResponse(url="/", status_code=303)
         return templates.TemplateResponse(request=request, name="login.html", context={"request": request, "error": "ভুল ইউজারনেম বা পাসওয়ার্ড!"})
@@ -406,7 +415,7 @@ async def login_post(request: Request, username: str = Form(...), password: str 
 async def logout(request: Request):
     username = request.session.get("username")
     if username:
-        try: supabase.table("users").update({"session_token": None}).eq("username", username).execute()
+        try: db_execute(supabase.table("users").update({"session_token": None}).eq("username", username))
         except: pass
     request.session.clear()
     return RedirectResponse(url="/login", status_code=303)
@@ -421,8 +430,8 @@ async def home(request: Request):
     credits = check_and_reset_credits(username)
     user_files = []
     try:
-        res = supabase.table("file_history").select("id, filename, processed_date").eq("username", username).order("id", desc=True).limit(10).execute()
-        if res.data: user_files = [(f['id'], f['filename'], f['processed_date']) for f in res.data]
+        res = db_execute(supabase.table("file_history").select("id, filename, processed_date").eq("username", username).order("id", desc=True).limit(10))
+        if res and res.data: user_files = [(f['id'], f['filename'], f['processed_date']) for f in res.data]
     except: pass
     return templates.TemplateResponse(request=request, name="index.html", context={"request": request, "username": username, "role": role, "credits": credits, "user_files": user_files})
 
@@ -454,21 +463,21 @@ async def upload_file(request: Request, file_ai: UploadFile = File(...), file_si
         process_master_pdf(input_ai_path, output_report_path, file_ai.filename, ai_percentage, shared_submission_id)
         apply_header_and_footer(input_sim_path, output_edited_path, shared_submission_id)
 
-        res_u = supabase.table("users").select("used_credits").eq("username", username).execute()
-        current_used = res_u.data[0].get("used_credits", 0) if res_u.data and res_u.data[0].get("used_credits") is not None else 0
+        res_u = db_execute(supabase.table("users").select("used_credits").eq("username", username))
+        current_used = res_u.data[0].get("used_credits", 0) if res_u and res_u.data and res_u.data[0].get("used_credits") is not None else 0
 
         if credits < 900000:
-            supabase.table("users").update({"daily_credits": credits - 1, "used_credits": current_used + 1}).eq("username", username).execute()
+            db_execute(supabase.table("users").update({"daily_credits": credits - 1, "used_credits": current_used + 1}).eq("username", username))
         else:
-            supabase.table("users").update({"used_credits": current_used + 1}).eq("username", username).execute()
+            db_execute(supabase.table("users").update({"used_credits": current_used + 1}).eq("username", username))
 
         current_time = get_bdt_time()
-        supabase.table("file_history").insert([
+        db_execute(supabase.table("file_history").insert([
             {"username": username, "filename": f"Report_{saved_ai_filename}", "processed_date": current_time},
             {"username": username, "filename": f"Edited_{saved_sim_filename}", "processed_date": current_time}
-        ]).execute()
+        ]))
         
-        supabase.table("credit_logs").insert({"username": username, "usage_date": get_bdt_date()}).execute()
+        db_execute(supabase.table("credit_logs").insert({"username": username, "usage_date": get_bdt_date()}))
         return RedirectResponse(url="/", status_code=303)
         
     except Exception as e:
@@ -480,7 +489,7 @@ def delete_file_and_history(file_id: int, output_path: str, upload_filename: str
         if os.path.exists(output_path): os.remove(output_path)
         in_path = os.path.join(UPLOAD_DIR, upload_filename)
         if os.path.exists(in_path): os.remove(in_path)
-        supabase.table("file_history").delete().eq("id", file_id).execute()
+        db_execute(supabase.table("file_history").delete().eq("id", file_id))
     except Exception as e:
         print("Delete error:", e)
 
@@ -492,8 +501,8 @@ async def download_past_file(request: Request, file_id: int, background_tasks: B
     
     username = request.session.get("username")
     try:
-        res = supabase.table("file_history").select("filename").eq("id", file_id).eq("username", username).execute()
-        if res.data:
+        res = db_execute(supabase.table("file_history").select("filename").eq("id", file_id).eq("username", username))
+        if res and res.data:
             saved_filename = res.data[0]['filename']
             output_path = os.path.join(OUTPUT_DIR, saved_filename)
             upload_filename = saved_filename.replace("Report_", "", 1) if saved_filename.startswith("Report_") else saved_filename.replace("Edited_", "", 1)
@@ -511,22 +520,22 @@ async def delete_my_file(request: Request, file_id: int = Form(...)):
     if not check_active_session(request): return RedirectResponse(url="/login", status_code=303)
     username = request.session.get("username")
     try:
-        res = supabase.table("file_history").select("filename").eq("id", file_id).eq("username", username).execute()
-        if res.data:
+        res = db_execute(supabase.table("file_history").select("filename").eq("id", file_id).eq("username", username))
+        if res and res.data:
             saved_filename = res.data[0]['filename']
             out_path = os.path.join(OUTPUT_DIR, saved_filename)
             upload_filename = saved_filename.replace("Report_", "", 1) if saved_filename.startswith("Report_") else saved_filename.replace("Edited_", "", 1)
             in_path = os.path.join(UPLOAD_DIR, upload_filename)
             if os.path.exists(in_path): os.remove(in_path)
             if os.path.exists(out_path): os.remove(out_path)
-            supabase.table("file_history").delete().eq("id", file_id).execute()
+            db_execute(supabase.table("file_history").delete().eq("id", file_id))
     except: pass
     return RedirectResponse(url="/", status_code=303)
 
 @app.post("/delete_all_files")
 async def delete_all_files(request: Request):
     if not check_active_session(request): return RedirectResponse(url="/login", status_code=303)
-    try: supabase.table("file_history").delete().eq("username", request.session.get("username")).execute()
+    try: db_execute(supabase.table("file_history").delete().eq("username", request.session.get("username")))
     except: pass
     return RedirectResponse(url="/", status_code=303)
 
