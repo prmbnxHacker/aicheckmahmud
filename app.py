@@ -103,26 +103,52 @@ def insert_pdf_text(page, point, text, fontsize=7.0, font_style="normal", color=
             pass
     page.insert_text(point, text, fontsize=fontsize, fontname="hebo" if font_style == "bold" else "helv", color=color)
 
+def strip_old_cover_pages(doc):
+    strong_cover_body_keywords = [
+        "detected as ai",
+        "score interpretation",
+        "highlight legend",
+        "important notice",
+        "quick submit",
+        "turnitin originality report",
+        "ai writing overview",
+        "integrity overview",
+        "submission declaration"
+    ]
+    for _ in range(2):
+        if len(doc) <= 1:
+            break
+        page = doc[0]
+        rect = page.rect
+        body_text_list = []
+        for block in page.get_text("blocks"):
+            # block format: (x0, y0, x1, y1, text, block_no, block_type)
+            if len(block) >= 5 and block[1] >= 40 and block[3] <= rect.height - 40:
+                body_text_list.append(str(block[4]))
+        
+        body_txt = " ".join(body_text_list).lower()
+        full_txt = page.get_text().lower()
+
+        is_cover = any(k in body_txt for k in strong_cover_body_keywords) or \
+                   ("cover page" in full_txt and "page 1 of" in full_txt)
+        
+        if is_cover:
+            doc.delete_page(0)
+        else:
+            break
+
 def process_master_pdf(user_pdf_path, output_path, original_filename, ai_percentage, shared_id):
     user_doc = fitz.open(user_pdf_path)
 
-    # Words and Characters count ignores first 2 pages and starts strictly from page 3 (index 2) onwards
+    # Smart cover page stripping: Remove old cover/overview pages if uploaded file is a previously generated report
+    strip_old_cover_pages(user_doc)
+
+    # Words and Characters count from stripped user document pages
     actual_words, actual_chars = 0, 0
-    pages_to_count = user_doc[2:] if len(user_doc) > 2 else user_doc
-    for p in pages_to_count:
+    for p in user_doc:
         text = p.get_text("text")
         actual_words += len(text.split())
         actual_chars += len(text)
-
-    # Smart cover page stripping: Remove old cover/overview pages if uploaded file is a previously generated report
-    if len(user_doc) > 1:
-        first_txt = user_doc[0].get_text()
-        if any(k in first_txt for k in ["Cover Page", "Quick Submit", "trn:oid", "detected as AI", "AI WRITING REPORT", "ACADEMI.CX"]):
-            user_doc.delete_page(0)
-            if len(user_doc) > 1:
-                p2_txt = user_doc[0].get_text()
-                if any(k in p2_txt for k in ["AI Writing Overview", "Integrity Overview", "detected as AI", "Overview", "Submission", "Declaration", "Plagiarism", "Assessment"]):
-                    user_doc.delete_page(0)
 
     actual_pages_count = len(user_doc)
     
@@ -272,8 +298,12 @@ def process_master_pdf(user_pdf_path, output_path, original_filename, ai_percent
             insert_pdf_text(page, fitz.Point(467.5, 758), "Submission ID", fontsize=6.0, font_style="normal", color=(0, 0, 0))
             insert_pdf_text(page, fitz.Point(513.0, 758), new_id, fontsize=6.0, font_style="normal", color=(0, 0, 0))
         else:
-            top_overlay_rect = fitz.Rect(0, 0, rect.width, 25)
-            bot_overlay_rect = fitz.Rect(0, rect.height - 24, rect.width, rect.height)
+            top_overlay_rect = fitz.Rect(0, 0, rect.width, 38)
+            bot_overlay_rect = fitz.Rect(0, rect.height - 30, rect.width, rect.height)
+
+            page.add_redact_annot(top_overlay_rect, fill=(1, 1, 1))
+            page.add_redact_annot(bot_overlay_rect, fill=(1, 1, 1))
+            page.apply_redactions()
 
             page.draw_rect(top_overlay_rect, fill=(1, 1, 1), color=None, overlay=True)
             page.draw_rect(bot_overlay_rect, fill=(1, 1, 1), color=None, overlay=True)
@@ -332,14 +362,7 @@ def apply_header_and_footer(input_pdf_path, output_path, shared_id):
     if not os.path.exists(logo_path):
         logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "logo.png")
 
-    if len(doc) > 1:
-        first_txt = doc[0].get_text()
-        if any(k in first_txt for k in ["Cover Page", "Quick Submit", "trn:oid", "detected as AI", "AI WRITING REPORT", "ACADEMI.CX"]):
-            doc.delete_page(0)
-            if len(doc) > 1:
-                p2_txt = doc[0].get_text()
-                if any(k in p2_txt for k in ["AI Writing Overview", "Integrity Overview", "detected as AI", "Overview", "Submission", "Declaration", "Plagiarism", "Assessment"]):
-                    doc.delete_page(0)
+    strip_old_cover_pages(doc)
 
     cyan_color = (0.7725490196078432, 0.9137254901960784, 0.9725490196078431)
     for i, page in enumerate(doc):
@@ -347,8 +370,12 @@ def apply_header_and_footer(input_pdf_path, output_path, shared_id):
         header_title = "Integrity Submission"
         header_text = f"Page {i + 1} of {len(doc)} - {header_title}"
 
-        top_overlay_rect = fitz.Rect(0, 0, rect.width, 25)
-        bot_overlay_rect = fitz.Rect(0, rect.height - 24, rect.width, rect.height)
+        top_overlay_rect = fitz.Rect(0, 0, rect.width, 38)
+        bot_overlay_rect = fitz.Rect(0, rect.height - 30, rect.width, rect.height)
+
+        page.add_redact_annot(top_overlay_rect, fill=(1, 1, 1))
+        page.add_redact_annot(bot_overlay_rect, fill=(1, 1, 1))
+        page.apply_redactions()
 
         page.draw_rect(top_overlay_rect, fill=(1, 1, 1), color=None, overlay=True)
         page.draw_rect(bot_overlay_rect, fill=(1, 1, 1), color=None, overlay=True)
