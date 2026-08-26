@@ -202,7 +202,7 @@ def process_master_pdf(user_pdf_path, output_path, original_filename, ai_percent
         for aa_inst in aa_matches:
             page1.add_redact_annot(fitz.Rect(aa_inst.x0 - 2, aa_inst.y0 - 2, aa_inst.x1 + 10, aa_inst.y1 + 2), fill=(1, 1, 1))
             page1.apply_redactions()
-            insert_pdf_text(page1, (aa_inst.x0, aa_inst.y1 - 4.0), "Labib Hasan", fontsize=20.0, font_style="author", color=(0, 0, 0))
+            insert_pdf_text(page1, (aa_inst.x0, aa_inst.y1 - 4.0), "Adverse", fontsize=20.0, font_style="author", color=(0, 0, 0))
 
     # 3. Document Details Replacements
     replacements = {
