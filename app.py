@@ -299,7 +299,7 @@ def process_master_pdf(user_pdf_path, output_path, original_filename, ai_percent
             insert_pdf_text(page, fitz.Point(513.0, 758), new_id, fontsize=6.0, font_style="normal", color=(0, 0, 0))
         else:
             top_overlay_rect = fitz.Rect(0, 0, rect.width, 38)
-            bot_overlay_rect = fitz.Rect(0, rect.height - 30, rect.width, rect.height)
+            bot_overlay_rect = fitz.Rect(0, rect.height - 36, rect.width, rect.height)
 
             page.add_redact_annot(top_overlay_rect, fill=(1, 1, 1))
             page.add_redact_annot(bot_overlay_rect, fill=(1, 1, 1))
